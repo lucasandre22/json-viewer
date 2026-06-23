@@ -25,17 +25,24 @@ type TreeNode = {
   kind: 'object' | 'array' | 'value';
   value: JsonValue;
   tooltip: string;
+  sourceStart: number;
+  sourceEnd: number;
   children: TreeNode[];
 };
 
 type JsonNodeData = {
   label: string;
   tooltip: string;
+  sourceStart: number;
+  sourceEnd: number;
   kind: TreeNode['kind'];
   isPendingDelete: boolean;
   canAddChild: boolean;
   onAddChild: (nodeId: string) => void;
   onDeleteClick: (nodeId: string) => void;
+  onSpanHover: (start: number, end: number) => void;
+  onSpanLeave: () => void;
+  onSpanSelect: (start: number, end: number) => void;
 };
 
 type JsonFlowNode = Node<JsonNodeData, 'jsonNode'>;
@@ -50,29 +57,250 @@ function formatValue(value: JsonValue): string {
   return JSON.stringify(value, null, 2) ?? 'null';
 }
 
-function buildTree(
-  value: JsonValue,
-  key: string,
-  nextId: { current: number },
-): TreeNode {
-  const id = `node_${nextId.current++}`;
-  const tooltip = formatValue(value);
-  const kind: TreeNode['kind'] =
-    Array.isArray(value) ? 'array' : value !== null && typeof value === 'object' ? 'object' : 'value';
+function parseJsonTree(text: string, nextId: { current: number } = { current: 0 }): TreeNode | null {
+  const length = text.length;
+  let index = 0;
 
+  const fail = (message: string): never => {
+    throw new Error(`${message} at position ${index}`);
+  };
+
+  const skipWhitespace = () => {
+    while (index < length && /\s/.test(text[index])) {
+      index += 1;
+    }
+  };
+
+  const parseString = (): string => {
+    if (text[index] !== '"') fail('Expected string');
+
+    const start = index;
+    index += 1;
+    let escaped = false;
+
+    while (index < length) {
+      const char = text[index];
+      if (escaped) {
+        escaped = false;
+      } else if (char === '\\') {
+        escaped = true;
+      } else if (char === '"') {
+        const raw = text.slice(start, index + 1);
+        index += 1;
+        return JSON.parse(raw) as string;
+      }
+
+      index += 1;
+    }
+
+    fail('Unterminated string');
+    return '';
+  };
+
+  const parseNumber = (): number => {
+    const start = index;
+    const numberPattern = /[0-9eE+\-\.]/;
+    while (index < length && numberPattern.test(text[index])) {
+      index += 1;
+    }
+
+    return JSON.parse(text.slice(start, index)) as number;
+  };
+
+  const parseValue = (key: string): TreeNode => {
+    skipWhitespace();
+    if (index >= length) fail('Unexpected end of input');
+
+    const start = index;
+    const char = text[index];
+
+    if (char === '{') {
+      index += 1;
+      skipWhitespace();
+
+      const children: TreeNode[] = [];
+      const objectValue: Record<string, JsonValue> = {};
+
+      if (text[index] === '}') {
+        index += 1;
+      } else {
+        while (index < length) {
+          skipWhitespace();
+          const childKey = parseString();
+          skipWhitespace();
+          if (text[index] !== ':') fail('Expected colon after object key');
+          index += 1;
+          const child = parseValue(childKey);
+          children.push(child);
+          objectValue[childKey] = child.value;
+          skipWhitespace();
+
+          if (text[index] === ',') {
+            index += 1;
+            continue;
+          }
+
+          if (text[index] === '}') {
+            index += 1;
+            break;
+          }
+
+          fail('Expected comma or closing brace');
+        }
+      }
+
+      return {
+        id: `node_${nextId.current++}`,
+        key,
+        kind: 'object',
+        value: objectValue,
+        tooltip: formatValue(objectValue),
+        sourceStart: start,
+        sourceEnd: index,
+        children,
+      };
+    }
+
+    if (char === '[') {
+      index += 1;
+      skipWhitespace();
+
+      const children: TreeNode[] = [];
+      const arrayValue: JsonValue[] = [];
+
+      if (text[index] === ']') {
+        index += 1;
+      } else {
+        while (index < length) {
+          const child = parseValue(String(children.length));
+          children.push(child);
+          arrayValue.push(child.value);
+          skipWhitespace();
+
+          if (text[index] === ',') {
+            index += 1;
+            continue;
+          }
+
+          if (text[index] === ']') {
+            index += 1;
+            break;
+          }
+
+          fail('Expected comma or closing bracket');
+        }
+      }
+
+      return {
+        id: `node_${nextId.current++}`,
+        key,
+        kind: 'array',
+        value: arrayValue,
+        tooltip: formatValue(arrayValue),
+        sourceStart: start,
+        sourceEnd: index,
+        children,
+      };
+    }
+
+    if (char === '"') {
+      const value = parseString();
+      return {
+        id: `node_${nextId.current++}`,
+        key,
+        kind: 'value',
+        value,
+        tooltip: formatValue(value),
+        sourceStart: start,
+        sourceEnd: index,
+        children: [],
+      };
+    }
+
+    if (char === 't' && text.slice(index, index + 4) === 'true') {
+      index += 4;
+      return {
+        id: `node_${nextId.current++}`,
+        key,
+        kind: 'value',
+        value: true,
+        tooltip: formatValue(true),
+        sourceStart: start,
+        sourceEnd: index,
+        children: [],
+      };
+    }
+
+    if (char === 'f' && text.slice(index, index + 5) === 'false') {
+      index += 5;
+      return {
+        id: `node_${nextId.current++}`,
+        key,
+        kind: 'value',
+        value: false,
+        tooltip: formatValue(false),
+        sourceStart: start,
+        sourceEnd: index,
+        children: [],
+      };
+    }
+
+    if (char === 'n' && text.slice(index, index + 4) === 'null') {
+      index += 4;
+      return {
+        id: `node_${nextId.current++}`,
+        key,
+        kind: 'value',
+        value: null,
+        tooltip: formatValue(null),
+        sourceStart: start,
+        sourceEnd: index,
+        children: [],
+      };
+    }
+
+    if (char === '-' || /\d/.test(char)) {
+      const value = parseNumber();
+      return {
+        id: `node_${nextId.current++}`,
+        key,
+        kind: 'value',
+        value,
+        tooltip: formatValue(value),
+        sourceStart: start,
+        sourceEnd: index,
+        children: [],
+      };
+    }
+
+    return fail('Unsupported JSON token');
+  };
+
+  try {
+    skipWhitespace();
+    const tree = parseValue('root');
+    skipWhitespace();
+
+    if (index !== length) {
+      fail('Unexpected trailing characters');
+    }
+
+    return tree;
+  } catch (error) {
+    console.error('Invalid JSON', error);
+    return null;
+  }
+}
+
+function copyTreeSpans(source: TreeNode, target: TreeNode): TreeNode {
   return {
-    id,
-    key,
-    kind,
-    value,
-    tooltip,
-    children:
-      value !== null && typeof value === 'object'
-        ? (Array.isArray(value)
-            ? value.map((entry, index) => [String(index), entry] as const)
-            : Object.entries(value)
-          ).map(([childKey, entry]) => buildTree(entry, childKey, nextId))
-        : [],
+    ...target,
+    sourceStart: source.sourceStart,
+    sourceEnd: source.sourceEnd,
+    tooltip: source.tooltip,
+    children: target.children.map((child, index) =>
+      copyTreeSpans(source.children[index] ?? child, child),
+    ),
   };
 }
 
@@ -130,6 +358,9 @@ function layoutTree(
   positions: Record<string, XYPosition>,
   onAddChild: (nodeId: string) => void,
   onDeleteClick: (nodeId: string) => void,
+  onSpanHover: (start: number, end: number) => void,
+  onSpanLeave: () => void,
+  onSpanSelect: (start: number, end: number) => void,
 ) {
   const nodes: JsonFlowNode[] = [];
   const edges: Edge[] = [];
@@ -153,6 +384,11 @@ function layoutTree(
         canAddChild: node.kind !== 'value',
         onAddChild,
         onDeleteClick,
+        onSpanHover,
+        onSpanLeave,
+        onSpanSelect,
+        sourceStart: node.sourceStart,
+        sourceEnd: node.sourceEnd,
       },
       position: {
         x: positions[node.id]?.x ?? depth * HORIZONTAL_GAP,
@@ -206,12 +442,25 @@ function JsonNode({ id, data }: NodeProps<JsonFlowNode>) {
     data.onAddChild(id);
   };
 
+  const handleMouseEnter = () => {
+    data.onSpanHover(data.sourceStart, data.sourceEnd);
+  };
+
+  const handleMouseLeave = () => {
+    data.onSpanLeave();
+  };
+
+  const handleSelect = () => {
+    data.onSpanSelect(data.sourceStart, data.sourceEnd);
+  };
+
   return (
-    <div className="group relative">
+    <div className="group relative" onMouseEnter={handleMouseEnter} onMouseLeave={handleMouseLeave}>
       <Handle type="target" position={Position.Left} />
       <div
         title={data.tooltip}
         className={`min-h-11 w-[220px] rounded-md border px-3 py-2 text-center text-sm font-medium text-white shadow-sm transition-colors duration-150 ${containerClass}`}
+        onClick={handleSelect}
       >
         <div className="flex items-center justify-between gap-2">
           <span
@@ -268,12 +517,17 @@ export default function JsonViewer() {
   const [tree, setTree] = useState<TreeNode | null>(null);
   const [pendingDeleteId, setPendingDeleteId] = useState<string | null>(null);
   const [positions, setPositions] = useState<Record<string, XYPosition>>({});
+  const [hoveredSpan, setHoveredSpan] = useState<{ start: number; end: number } | null>(null);
+  const [selectedSpan, setSelectedSpan] = useState<{ start: number; end: number } | null>(null);
+  const textareaRef = useRef<HTMLTextAreaElement | null>(null);
   const nextIdRef = useRef(0);
   const nodeTypes = useMemo(() => ({ jsonNode: JsonNode }), []);
 
   const updateJson = useCallback((value: string) => {
     setRawJson(value);
     setPendingDeleteId(null);
+    setHoveredSpan(null);
+    setSelectedSpan(null);
 
     if (!value.trim()) {
       nextIdRef.current = 0;
@@ -284,9 +538,10 @@ export default function JsonViewer() {
 
     try {
       nextIdRef.current = 0;
-      const parsed = JSON.parse(value) as JsonValue;
-      const nextTree = buildTree(parsed, 'root', nextIdRef);
-      setTree(normalizeTree(nextTree));
+      const parseIdTracker = { current: 0 };
+      const parsedTree = parseJsonTree(value, parseIdTracker);
+      nextIdRef.current = parseIdTracker.current;
+      setTree(parsedTree ? normalizeTree(parsedTree) : null);
       setPositions({});
     } catch (error) {
       console.error('Invalid JSON', error);
@@ -295,8 +550,20 @@ export default function JsonViewer() {
     }
   }, []);
 
+  const activeSpan = hoveredSpan ?? selectedSpan;
+
+  React.useEffect(() => {
+    if (!activeSpan || !textareaRef.current) return;
+
+    const textarea = textareaRef.current;
+    textarea.focus({ preventScroll: true });
+    textarea.setSelectionRange(activeSpan.start, activeSpan.end);
+  }, [activeSpan]);
+
   const handleNodeClick = async (_: React.MouseEvent, node: JsonFlowNode) => {
     try {
+      setSelectedSpan({ start: node.data.sourceStart, end: node.data.sourceEnd });
+      setHoveredSpan(null);
       await navigator.clipboard.writeText(node.data.tooltip);
     } catch (error) {
       console.error('Failed to copy node value', error);
@@ -334,6 +601,8 @@ export default function JsonViewer() {
                 kind: 'value',
                 value: null,
                 tooltip: 'null',
+                sourceStart: 0,
+                sourceEnd: 0,
                 children: [],
               },
             ],
@@ -347,9 +616,15 @@ export default function JsonViewer() {
       };
 
       const nextTree = normalizeTree(appendChild(current));
-      setRawJson(JSON.stringify(serializeTree(nextTree), null, 2));
+      const serialized = JSON.stringify(serializeTree(nextTree), null, 2);
+      const spanTree = parseJsonTree(serialized);
+      const nextTreeWithSpans = spanTree ? copyTreeSpans(spanTree, nextTree) : nextTree;
+
+      setRawJson(serialized);
       setPositions((currentPositions) => prunePositions(currentPositions, nextTree));
-      return nextTree;
+      setHoveredSpan(null);
+      setSelectedSpan(null);
+      return nextTreeWithSpans;
     });
     setPendingDeleteId(null);
   }, []);
@@ -377,15 +652,41 @@ export default function JsonViewer() {
       setPendingDeleteId(null);
       const nextTree = removeNode(current);
       const normalized = nextTree ? normalizeTree(nextTree) : null;
-      setRawJson(normalized ? JSON.stringify(serializeTree(normalized), null, 2) : '');
-      setPositions((currentPositions) => prunePositions(currentPositions, normalized));
-      return normalized;
+      if (!normalized) {
+        setRawJson('');
+        setPositions({});
+        setHoveredSpan(null);
+        setSelectedSpan(null);
+        return null;
+      }
+
+      const serialized = JSON.stringify(serializeTree(normalized), null, 2);
+      const spanTree = parseJsonTree(serialized);
+      const normalizedWithSpans = spanTree ? copyTreeSpans(spanTree, normalized) : normalized;
+
+      setRawJson(serialized);
+      setPositions((currentPositions) => prunePositions(currentPositions, normalizedWithSpans));
+      setHoveredSpan(null);
+      setSelectedSpan(null);
+      return normalizedWithSpans;
     });
   }, [pendingDeleteId]);
 
   const { nodes, edges } = useMemo(() => {
     if (!tree) return { nodes: [], edges: [] };
-    return layoutTree(tree, pendingDeleteId, positions, addChild, deleteNode);
+    return layoutTree(
+      tree,
+      pendingDeleteId,
+      positions,
+      addChild,
+      deleteNode,
+      (start, end) => setHoveredSpan({ start, end }),
+      () => setHoveredSpan(null),
+      (start, end) => {
+        setSelectedSpan({ start, end });
+        setHoveredSpan(null);
+      },
+    );
   }, [tree, pendingDeleteId, positions, addChild, deleteNode]);
 
   const handleNodesChange = useCallback((changes: NodeChange[]) => {
@@ -412,6 +713,7 @@ export default function JsonViewer() {
       <div className="w-1/3 border-r border-slate-800 flex flex-col p-4">
         <h1 className="text-xl font-bold mb-4">JSON Input</h1>
         <textarea
+          ref={textareaRef}
           className="flex-1 bg-slate-900 border border-slate-700 rounded p-2 font-mono text-sm focus:outline-none focus:border-blue-500"
           value={rawJson}
           onChange={(e) => updateJson(e.target.value)}
